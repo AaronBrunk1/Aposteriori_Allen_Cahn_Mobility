@@ -1,0 +1,115 @@
+//int Verbosity = verbosity;
+verbosity = 0;
+
+load "iovtk"
+load "UMFPACK64"
+load "Element_QF"
+
+int[int] Order2 = [1,1,1];
+string DataName2 = "phi+mu+mob";
+
+string result = "Sol_AC";
+exec("mkdir " + result);
+
+real[int] colorhsv=[ // color hsv model
+   4./6., 1 , 0.5, // dark blue
+    4./6., 1 , 1, // blue
+    5./6., 1 , 1, // magenta
+    1, 1. , 1, // red
+    1, 0.5 , 1 // light red
+   ];
+real[int] viso(32);
+ 
+for (int i = 0; i < viso.n; i++)
+    viso[i] = 2./(viso.n-1)*i -1;
+
+real gamma = (1./16.)^2;
+int nt = 50^2, n = 80; //Time and Space Resolution
+border C01(t=0, 1){x=-2; y=-2+4*t; label=1;}
+border C02(t=0, 1){x=-2+4*t; y=2; label=1;}
+border C03(t=0, 1){x=2; y=2-4*t; label=1;}
+border C04(t=0, 1){x=2-4*t; y=-2; label=1;}
+mesh Th = buildmesh(C01(-n) + C02(-n) + C03(-n) + C04(-n));
+ 
+
+real T = 0.1;
+real dt = 1./nt;
+real alpha = 1./dt;
+int i, plt = 1;
+real err ;
+real tol = 1e-9;
+
+
+fespace Vh(Th,[P2,P2]);
+Vh [phi,mu],[phiold,muold],[psi,xi],[phiit,muit],[phidelta,mudelta];
+
+fespace Vhs(Th,P2);
+Vhs z, phiinit , muinit, vv;
+real hmax = h[].max;
+
+fespace VhPr(Th,P1);
+VhPr phiplt, muplt, mobplt;
+
+func d4 = abs(sqrt(x^2 + y^2))- 4./10.;
+func d5 = abs(sqrt(x^2 + y^2))- 1./1.;
+
+real gammar = 1./16.^2;
+func uwelle = -tanh(max(-d4,d5)/sqrt(2*gammar)) ; //donut
+phiinit = uwelle;
+
+
+fespace VhT(Th,FEQF9); //FEQF5
+VhT  b ;
+
+
+[phiold,muold]=[phiinit,muinit];
+
+
+problem ACnon([phidelta,mudelta],[xi,psi])=
+        int2d(Th)(
+            1.0/dt*phidelta*xi + b*mudelta*xi
+            + mudelta*psi -(dx(phidelta)*dx(psi)+dy(phidelta)*dy(psi))
+            -1.0/gamma*(3*phi^2-1.)*phidelta*psi
+        )
+        +int2d(Th)(
+            1.0/dt*phi*xi + b*mu*xi
+            -1.0/dt*phiold*xi + mu*psi
+            -(dx(phi)*dx(psi)+dy(phi)*dy(psi))
+            -1.0/gamma*(phi^3-phi)*psi
+        );
+
+//----------------------------------------------------------------------------
+// Time Loop
+
+		phiplt=phi; muplt=mu; mobplt = 0.1*(1.+phiplt)^2*(1.-phiplt)^2 + 1.; 
+		savevtk(result+"/results="+(0)+".vtk", Th, [phiplt,muplt,mobplt], dataname=DataName2, order=Order2);
+
+	//phiolder = phiold;
+for (int i=0; i<nt*T;i++){		
+	
+	cout << "TIMESTEP:" << i << endl;
+	z = phiold;
+	b =  0.1*(1.+z)^2*(1.-z)^2 + 1.;
+	
+	err = 1;
+	[phi,mu]=[phiold,muold];
+	
+	while (err > tol) {
+	
+	ACnon;
+	[phi,mu]=[phi,mu] + [phidelta,mudelta];
+	err = sqrt( int2d(Th)( phidelta^2 + mudelta^2)  );
+	cout << "Newtonerror: "<< err << endl;
+	}
+	
+	
+
+	[phiold,muold]=[phi,mu];
+     
+	if ((i%plt)==0){
+	
+	plot( cmm=" Volume fraction at time t="+(i+1)*dt,WindowIndex=0,boundary=0, phi, value=true, fill=true,viso=viso(0:viso.n-1));
+	phiplt=phi; muplt=mu; mobplt = 0.1*(1.+phiplt)^2*(1.-phiplt)^2 + 1.; 
+		savevtk(result+"/results="+(i+1)+".vtk", Th, [phiplt,muplt,mobplt], dataname=DataName2, order=Order2);
+	}
+}

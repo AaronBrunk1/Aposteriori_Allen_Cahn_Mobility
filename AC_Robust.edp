@@ -1,0 +1,346 @@
+load "iovtk"
+
+int[int] Order2 = [1,1,1];
+string DataName2 = "phi+mu+mob";
+
+verbosity = 0;
+
+load "UMFPACK64"
+load "Element_QF"
+
+real[int] colorhsv=[ // color hsv model
+   4./6., 1 , 0.5, // dark blue
+    4./6., 1 , 1, // blue
+    5./6., 1 , 1, // magenta
+    1, 1. , 1, // red
+    1, 0.5 , 1 // light red
+   ];
+real[int] viso(32);
+ 
+for (int i = 0; i < viso.n; i++)
+    viso[i] = 2./(viso.n-1)*i -1;
+
+
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Parameters gamma, nt, 1/n=h
+
+real gamma = (1./16.)^2;
+int nt = 30000, n = 100; //Time and Space Resolution
+real T = 0.1;            // final time
+real dt = 1./nt;
+real alpha = 1./dt;
+int i, plt = 1;
+real err ;
+real tol = 1e-9;	  // newton tolerance
+int estimator = 1;    // if zero only solutions is computed
+
+
+
+string result = "Gamm-dep_gamma"+gamma;
+exec("mkdir " + result);
+
+
+// Build domain
+border C01(t=0, 1){x=-2; y=-2+4*t; label=1;}
+border C02(t=0, 1){x=-2+4*t; y=2; label=1;}
+border C03(t=0, 1){x=2; y=2-4*t; label=1;}
+border C04(t=0, 1){x=2-4*t; y=-2; label=1;}
+mesh Th = buildmesh(C01(-n) + C02(-n) + C03(-n) + C04(-n));
+	 
+
+
+// Define many array	
+real[int]  r1L2(nt+1);
+real[int]  r1Hm(nt+1);
+real[int]  r2L2(nt+1);
+real[int]  r2Hm(nt+1);
+real[int]  Inteig(nt+1);
+
+real globalhatphiinf=0, globalhatmuinf=0;
+
+real lambda = 0, B1=0 , B2=0;
+
+real gres1=0. , gres2=0.,  rho=1., Icerr = 0., Mt=0., At=0., alphaglobal=0., checker=0.;
+
+
+
+// Define FESpaces
+// Product P2 for the problem
+fespace Vh(Th,[P2,P2]);
+Vh [phi,mu],[phiold,muold],[psi,xi],[phiit,muit],[phidelta,mudelta];
+
+fespace Vhs(Th,P2); // single P2 for computing things 
+Vhs z, phiinit , phistart , phieig , muinit, vv, phiolder, h=hTriangle,u1,u2, aux1,aux2,fdiffp, Nor1, Nor2;
+
+real hmax = h[].max;
+real hmin = h[].min;
+
+fespace VhPr(Th,P1); // single P1 for VTK
+VhPr phiplt, muplt, mobplt;
+
+fespace VhT(Th,FEQF9); // quadratur space for the nonlinearity b and an f related error
+VhT b,fdiff;
+
+// Build IC
+func d4 = abs(sqrt(x^2 + y^2))- 4./10.;
+func d5 = abs(sqrt(x^2 + y^2))- 1./1.;
+
+func uwelle = -tanh(max(-d4,d5)/sqrt(2*gamma)) ; //donut
+phiinit = uwelle;
+
+
+
+// Build IC mu
+solve muinitt(muinit,vv) = 
+int2d(Th)(muinit*vv) - int2d(Th)(dx(phiinit)*dx(vv) + dy(phiinit)*dy(vv) + 1./gamma*(phiinit^3-phiinit)*vv );
+
+
+[phiold,muold]=[phiinit,muinit];
+
+// Define the Newton problem, delta are the newton increments/ if one likes mobility at new timestep one has to add a newton type term here
+problem ACnon([phidelta,mudelta],[xi,psi])=
+			int2d(Th)(
+				1.0/dt*phidelta*xi + b*mudelta*xi
+				+ mudelta*psi -(dx(phidelta)*dx(psi)+dy(phidelta)*dy(psi))
+				-1.0/gamma*(3*phi^2-1.)*phidelta*psi
+			)
+			+int2d(Th)(
+				1.0/dt*phi*xi + b*mu*xi
+				-1.0/dt*phiold*xi + mu*psi
+				-(dx(phi)*dx(psi)+dy(phi)*dy(psi))
+				-1.0/gamma*(phi^3-phi)*psi
+			);
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// Time Loop
+
+	for (int i=0; i<nt*T;i++){		
+		
+		cout << "TIMESTEP:" << i << endl;
+		// Update mobility old time step // can be canced
+		z = phiold;
+		b =  0.1*(1.+z)^2*(1.-z)^2 + 1.;
+		
+		err = 1;
+		[phi,mu]=[phiold,muold];
+		
+		while (err > tol) {
+		// Newton until tolerance is met
+		ACnon;
+		[phi,mu]=[phi,mu] + [phidelta,mudelta];
+		err = sqrt( int2d(Th)( phidelta^2 + mudelta^2)  );
+		cout << "Newtonerror: "<< err << endl;
+		}
+		
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		// A posteriori estimators
+		if (estimator == 1 ){
+		Icerr = 0.; //can be done via estimator
+		
+		// Define estimators and midpoints
+		real HH1, Hdt, HL2, H2,Hmdt, W13, Hm1, Hinfty;
+		Vhs dtphi = alpha*(phi-phiold), dtmu = alpha*(mu-muold);
+		Vhs mumid=0.5*(muold+mu), phimid=0.5*(phi+phiold);
+		
+		// H1 phi
+		HH1 = 1./6.*(  dt*int2d(Th)(hTriangle^2*(mu - 1./gamma*(phi^3-phi) + dxx(phi) +dyy(phi))^2)  
+			+ dt*int2d(Th)(hTriangle^2*(muold -  1./gamma*(phiold^3-phiold) + dxx(phiold) +dyy(phiold))^2)
+			+ 4.*dt*int2d(Th)(hTriangle^2*(mumid -  0.5/gamma*((phi^3-phi) + (phiold^3-phiold)) + dxx(phimid) + dyy(phimid))^2)
+			+ dt*intalledges(Th)((1-nTonEdge)*lenEdge^1*jump(N.x*dx(phi) + N.y*dy(phi))^2)            
+			+ dt*intalledges(Th)((1-nTonEdge)*lenEdge^1*jump(N.x*dx(phiold) + N.y*dy(phiold))^2)
+			+ 4.*dt*intalledges(Th)((1-nTonEdge)*lenEdge^1*jump(N.x*dx(phimid) + N.y*dy(phimid))^2));
+		// L2 phi	
+		HL2 = 1./6.*( dt*int2d(Th)(hTriangle^4*(mu - 1./gamma*(phi^3-phi) + dxx(phi) +dyy(phi))^2)   
+			+ dt*int2d(Th)(hTriangle^4*(muold  -  1./gamma*(phiold^3-phiold) + dxx(phiold) +dyy(phiold))^2)
+			+ 4.*dt*int2d(Th)(hTriangle^4*(mumid -  0.5/gamma*((phi^3-phi) + (phiold^3-phiold)) + dxx(phimid) + dyy(phimid))^2)
+			+ dt*intalledges(Th)((1-nTonEdge)*lenEdge^3*jump(N.x*dx(phi) + N.y*dy(phi))^2)            
+			+ dt*intalledges(Th)((1-nTonEdge)*lenEdge^3*jump(N.x*dx(phiold) + N.y*dy(phiold))^2)
+			+ 4.*dt*intalledges(Th)((1-nTonEdge)*lenEdge^3*jump(N.x*dx(phimid) + N.y*dy(phimid))^2));
+		// H-1 phi	
+		Hm1 = 1./6.*( dt*int2d(Th)(hTriangle^6*(mu - 1./gamma*(phi^3-phi) + dxx(phi) +dyy(phi))^2)   
+			+ dt*int2d(Th)(hTriangle^6*(muold  -  1./gamma*(phiold^3-phiold) + dxx(phiold) +dyy(phiold))^2)
+			+ 4.*dt*int2d(Th)(hTriangle^6*(mumid -  0.5/gamma*((phi^3-phi) + (phiold^3-phiold)) + dxx(phimid) + dyy(phimid))^2)
+			+ dt*intalledges(Th)((1-nTonEdge)*lenEdge^5*jump(N.x*dx(phi) + N.y*dy(phi))^2)            
+			+ dt*intalledges(Th)((1-nTonEdge)*lenEdge^5*jump(N.x*dx(phiold) + N.y*dy(phiold))^2)
+			+ 4.*dt*intalledges(Th)((1-nTonEdge)*lenEdge^5*jump(N.x*dx(phimid) + N.y*dy(phimid))^2));	
+		// L2 dtphi	
+		Hdt = dt*int2d(Th)(hTriangle^4*(dtmu- alpha/gamma*((phi^3-phi)- (phiold^3-phiold)) + dxx(dtphi) + dyy(dtphi))^2) 
+			+ dt*intalledges(Th)((1-nTonEdge)*lenEdge^3*jump(N.x*dx(dtphi) + N.y*dy(dtphi))^2);     
+		// H-1 dtphi
+		Hmdt = dt*int2d(Th)(hTriangle^6*(dtmu- alpha/gamma*((phi^3-phi)- (phiold^3-phiold)) + dxx(dtphi) + dyy(dtphi))^2) 
+			+ dt*intalledges(Th)((1-nTonEdge)*lenEdge^5*jump(N.x*dx(dtphi) + N.y*dy(dtphi))^2);  		
+		
+		// Define the auxilary estimators infty norms
+		Vhs Zk = hTriangle^4*(mu- 1/gamma*(phi^3-phi) + dxx(phi) + dyy(phi))^2 ; 
+		Vhs Z= hTriangle^4*(dtmu- alpha/gamma*((phi^3-phi)- (phiold^3-phiold)) + dxx(dtphi) + dyy(dtphi))^2; 
+		varf vNeumanphi(used,z) = intalledges(Th)(z*jump(dx(phi)*N.x+dy(phi)*N.y)^2);
+		varf vNeumandtphi(used,z) = intalledges(Th)(z*jump(dx(dtphi)*N.x+dy(dtphi)*N.y)^2);
+		Nor1[]= vNeumanphi(0,Vhs); Nor2[]= vNeumandtphi(0,Vhs);
+		
+		// Compute infty/w13 indicator
+		Hinfty = sqrt(Zk[].max) + sqrt(Nor1[].max);
+		W13   = dt/6.*(  (int2d(Th)(hTriangle^3*(mu - 1./gamma*(phi^3-phi) + dxx(phi) +dyy(phi))^3)  
+		                 + intalledges(Th)((1-nTonEdge)*lenEdge^1*jump(N.x*dx(phi) + N.y*dy(phi))^3))^(2/3) 
+			+ (int2d(Th)(hTriangle^3*(muold -  1./gamma*(phiold^3-phiold) + dxx(phiold) +dyy(phiold))^3)
+			+ intalledges(Th)((1-nTonEdge)*lenEdge^1*jump(N.x*dx(phiold) + N.y*dy(phiold))^3))^(2/3) 
+			+ 4.*(int2d(Th)(hTriangle^3*(mumid -  0.5/gamma*((phi^3-phi) + (phiold^3-phiold)) + dxx(phimid) + dyy(phimid))^3)            
+			+ intalledges(Th)((1-nTonEdge)*lenEdge^1*jump(N.x*dx(phimid) + N.y*dy(phimid))^3))^(2/3) ); 
+
+
+		// Maxima of phi and time errors
+		Vhs phio=phiold, phin=phi, muo=muold, mun=mu;
+		real phiinf, TimephiL2, TimephiH1, TimemuL2, MuL3, MuL2, TimefL2,  r1,r2, r1neg,r2neg, TimemuHm1,TimefHm1, hatphiw13;
+		real bmax = 1.1 + 1., bmin = 1., bprime = 0.1*1.54;
+		Vhs absphi = abs(phin), absphio = abs(phio);
+		phiinf    = max(absphi[].max,absphio[].max);
+		hatphiw13 = W13 + 2*(int2d(Th) (dx(phimid)^(3)+ dy(phimid)^3))^(2/3);
+		
+		
+		
+		TimephiH1 = dt^3/3.*(int2d(Th) (dtphi^6))^(2/6);
+		TimephiL2 = dt^3/3.*(int2d(Th) (dtphi^2))^(2);
+		TimemuL2  = dt^3/3.*int2d(Th) (dtmu^2);
+		MuL3 = (int2d(Th)(abs(mun)^3.))^(2/3);
+		TimefL2 = dt/6.*(  4.*int2d(Th)((0.5*phin^3+ 0.5*phio^3- phimid^3)^2     ) );
+		
+		solve neglapmu(aux1,vv) = 
+	     int2d(Th)(dx(aux1)*dx(vv) + dy(aux1)*dy(vv) ) - int2d(Th) (dtmu*vv);
+	   
+	    TimemuHm1 = dt^3/3.*int2d(Th)(dx(aux1)^2 + dy(aux1)^2);
+	   
+	    fdiff = 0.5*phin^3 + 0.5*phio^3 - phimid^3;
+	   
+		solve neglapf(aux2,vv) = 
+	    int2d(Th)(dx(aux2)*dx(vv) + dy(aux2)*dy(vv) ) - int2d(Th) (fdiff*vv);
+	   
+	    TimefHm1 = 4.*dt/6.*int2d(Th)(dx(aux2)^2 + dy(aux2)^2);
+		
+
+		// define global things mainly for M and B
+		real localhatinf,Linfymu,Linfybmu, Linfydtphi, B, alpha, dummy;
+
+							
+		Linfydtphi = max(abs(dtphi[].max),abs(dtphi[].min)) + sqrt(Z[].max) + sqrt(Nor2[].max);
+		Linfymu = max(abs(muo[].max),abs(mun[].max),abs(mumid[].max));
+		localhatinf =  log(hmin)^2*Hinfty + phiinf;
+		globalhatphiinf = max(localhatinf + phiinf,globalhatphiinf);
+		globalhatmuinf = max(Linfymu,globalhatmuinf);
+
+		// the correction term for the eigenvalue cheat
+		real fcorrect = 1./gamma^2*((1.+ 3.*(globalhatphiinf + phiinf)))*HL2;
+		
+		
+		// Build local residuals
+		r1 = Hdt + bprime^2*(TimephiH1 + HH1)*MuL3 + bmax^2*TimemuL2;
+		r2 = 1./gamma^2*( (1.+ 3.*(globalhatphiinf^2 + phiinf^2))^2*HL2 +  TimefL2);
+			
+		r1neg = Hmdt + bprime^2*(TimephiL2 + HL2)*MuL3 + (bmax^2 + bprime^2*hatphiw13)*TimemuHm1; 
+		r2neg = 1./gamma^2*( (1.+ 3.*(globalhatphiinf^2 + phiinf^2))^2*Hm1 + (1.+ 3.*(globalhatphiinf + phiinf))^2*(hatphiw13)*Hm1 +  TimefHm1)	;
+		
+		cout << r1 << " " <<  Hdt << " " << TimemuL2 << endl;
+		cout << r1neg << " " <<  Hmdt << " " << TimemuHm1 << endl;
+		cout << r2 << " " <<  HL2 << " " << TimefL2 << endl;
+		cout << r2neg << " " <<  Hm1 << " " << TimefHm1 << endl;
+		
+		
+		// Build global residuals
+		gres1 = gres1 + gamma^2*r1 + (1./bmin^2 + bprime^2/bmin^4*hatphiw13)*r1neg; 
+		gres2 = gres2 + gamma^2*r2 + r2neg; 
+		cout << "Residuals: " << gres1 << "   " <<  gres2 << endl; 
+		
+		
+		
+		// Compute the integrated eigenvalue at the 3 points
+
+		real sigma = 0.;  // value of the shift 
+		varf a(u1,u2)= int2d(Th)(  0.5*(dx(u1)*dx(u2) + dy(u1)*dy(u2)) + 1./gamma*2.*(3.*phiold^2-1.)*u1*u2 - sigma*u1*u2 );  // Boundary condition               
+		varf bvar(u1,u2) = int2d(Th)(  u1*u2 ) ; 
+		matrix A= a(Vhs,Vhs,solver=sparsesolver); 
+		matrix BB= bvar(Vhs,Vhs,solver=CG); 
+		int nev=10;  // number of computed eigen valeu close to sigma
+		real[int] ev(nev); // to store nev eigein value
+		Vhs[int] eV(nev);   // to store nev eigen vector
+		EigenValue(A,BB, sym=true,sigma=sigma,value=ev,vector=eV,tol=1e-10,maxit=0,ncv=0);  
+		real sf = ev.min;
+		lambda = lambda + dt/6.*min(sf,0.);
+
+ 
+		varf a1(u1,u2)= int2d(Th)(  0.5*(dx(u1)*dx(u2) + dy(u1)*dy(u2)) + 1./gamma*2.*(3.*phimid^2-1.)*u1*u2 - sigma*u1*u2 );  // Boundary condition               
+		varf bvar1(u1,u2) = int2d(Th)(  u1*u2 ) ; 
+		matrix A1= a1(Vhs,Vhs,solver=sparsesolver); 
+		matrix BB1= bvar1(Vhs,Vhs,solver=CG); 
+		real[int] ev1(nev); // to store nev eigein value
+		Vhs[int] eV1(nev);   // to store nev eigen vector
+		EigenValue(A1,BB1, sym=true,sigma=sigma,value=ev1,vector=eV1,tol=1e-10,maxit=0,ncv=0); 
+		sf = ev.min;
+		lambda = lambda + 4.*dt/6.*min(sf,0.);
+		//cout << ev1(0) << endl;
+	
+	
+		varf a2(u1,u2)= int2d(Th)(  0.5*(dx(u1)*dx(u2) + dy(u1)*dy(u2)) + 1./gamma*2.*(3.*phi^2-1.)*u1*u2 - sigma*u1*u2 );  // Boundary condition               
+		varf bvar2(u1,u2) = int2d(Th)(  u1*u2 ) ; 
+		matrix A2= a2(Vhs,Vhs,solver=sparsesolver); 
+		matrix BB2= bvar2(Vhs,Vhs,solver=CG); 
+		real[int] ev2(nev); // to store nev eigein value
+		Vhs[int] eV2(nev);   // to store nev eigen vector
+		EigenValue(A2,BB2, sym=true,sigma=sigma,value=ev2,vector=eV2,tol=1e-10,maxit=0,ncv=0); 
+		sf = ev.min;
+		lambda = lambda + dt/6.*min(sf,0.);
+		//cout << ev2(0) << endl;
+		
+		
+		
+		// Compute the conditional quantities
+		// Note 10000 can be replaced by another big number
+		alpha = dt/2. + dt*bprime/bmin^2*bmax*Linfymu + gamma*dt*6.*(1.+ globalhatphiinf)*Linfydtphi + dt*gamma^2*(bprime+bprime/bmin)*Linfymu^2 - lambda;
+		B1 = 4.*max(8.,1./bmin)*bprime*bmax/(bmin^(5/2))*globalhatmuinf;
+		B2 = 4.*max(8.,1./bmin)*(2./bmin)^(2./10000.)*(bprime*bmax/(gamma*bmin)^2+ 1./gamma^2)*(1.+globalhatphiinf)^(2.-2./10000.);
+		At = Icerr + gres1 + gres2 +fcorrect;
+		alphaglobal = alphaglobal + alpha;
+		
+		
+		// Computed conditional stability check:
+		Mt = exp(alphaglobal);
+		cout << "At/Mt/B1/B2: " << At << "   " <<  Mt << "   " <<  B1 << "   " << B2 << endl; 	
+		checker = 8*(1+(i+1)*dt)*(B1*sqrt(8*At*Mt) + B2*(8*At*Mt)^(1./10000.));
+		
+		if (checker > 1){  cout << "unbounded" << endl;   }
+		else { cout << "Error is bounded by: " << 8*At*Mt << endl; }
+		
+		}
+		
+		// Update old step
+		[phiold,muold]=[phi,mu];
+		
+		// Plotting & save
+		
+		if ((i%plt)==0){
+		
+		plot( cmm=" Volume fraction at time t="+(i+1)*dt,WindowIndex=0,boundary=0, phi, value=true, fill=true,viso=viso(0:viso.n-1));
+		phiplt=phi; muplt=mu; mobplt = 0.1*(1.+phiplt)^2*(1.-phiplt)^2 + 1.; 
+			savevtk(result+"/results="+(i+1)+".vtk", Th, [phiplt,muplt,mobplt], dataname=DataName2, order=Order2);
+		}
+}
+		
+		
+		
+		
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		// Can be used for output
+		//ofstream file(result+"/metadata.txt", binary);
+		//file.precision(16); file << "r1L2" << " , "  << "r1Hm" <<  endl;
+		//for (int i = 0; i < (nt+1); i++) { file << r1L2[i] << " , " << r1Hm[i]  << endl; }
+		
+		
